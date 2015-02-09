@@ -14,8 +14,9 @@ The supported arm tools are available from the mentor graphics (formally code so
 https://sourcery.mentor.com/GNUToolchain/release1803?lite=arm
 
 In order to add the toolkit binaries directory to your bash profile path. Open your bash profile using the following command;
-
-> sudo gedit ~/.bashrc
+'''
+sudo gedit ~/.bashrc
+'''
 
 The following should be appended to the end of the file where /home/paul/data/arm/gnutools/bin is the directory of the arm GNU tools binaries directory.
 
