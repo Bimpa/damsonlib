@@ -1,0 +1,805 @@
+@/*
+@ * SUMMARY
+@ *  Assembly functions for the damsonlib runtime system
+@ *
+@ * AUTHORS
+@ *  Paul Richmond - p.richmond@sheffield.ac.uk
+@ *  David J Allerton
+@ *
+@ *
+@ * COPYRIGHT
+@ *  Copyright (C)    The University of Sheffield - 2013
+@ *  BIMPA Project
+@ */
+
+
+                .include "spinnaker.gas"
+                
+                .section .text
+
+		@ exports for c module
+		.global udiv 
+                .global init_damsonlib
+                .global restore_process
+                .global end_process
+                .global timer_interrupt
+                .global dma_interrupt
+                .global packet_interrupt
+                .global syncnodes_packet_interrupt
+                .global sleep
+
+		@some useful debug functions
+                .global enable_interrupts
+                .global disable_interrupts
+                .global get_cpsr
+                .global get_sp
+
+                
+
+		@ external in spinn_io c module
+                .global io_printf
+                
+                @ externals in sync
+                .global sync_handle_packet
+                
+                @ externals procedures in cdamsonrt c module
+                .global c_create_process
+                .global c_delete_process
+                .global c_reschedule
+                .global c_tickrate
+                .global c_sendpkt
+                .global c_damson_exit
+                .global c_syncnodes
+                .global c_handle_timer
+                .global c_handle_sdtransfer
+                .global c_handle_sdcomplete
+                .global c_handle_delay
+                
+                @ externals globals in cdamsonrt c module
+                .global CURRENT_PCB
+                .global I_STACK_END
+                .global DAMSON_GV_START
+                .global NODE_ID
+                
+                .equ	SYNC_PKT, (0x1ffff << 11)
+                
+                
+
+                
+
+pcb		.req	r12	@ damson current pcb address
+gv		.req	r10	@ damson global vector
+
+@-------------------------------------------------------------------------------
+@ damsonlib arithmetic
+@-------------------------------------------------------------------------------
+   
+@-------------------------------------------------------------------------------          
+@ 32-bit fixed-point divide based on Henri Thomas' algorithm:
+@ A Fast Hi Precision Fixed Point Divide
+@ http://me.henri.net/fp-div.html[09/03/2010 12:07:45]
+
+num             .req    r0
+den             .req    r1
+mod             .req    r2
+cnt             .req    r3
+quo             .req    r4
+sign            .req    r5
+
+fpdiv:          
+
+@ set sign and ensure numerator and denominator are positive
+                cmp     den, #0                 @ exceptioin if den == zero
+                beq     div0
+                eor     sign, num, den          @ sign = num ^ den
+                rsbmi   den, den, #0            @ den = -den if den < 0
+                subs    mod, den, #1            @ mod = den
+                beq     div1                    @ return if den == 1
+                movs    cnt, num                @ num = -num if num < 0
+                rsbmi   num, num, #0            @ skip if denominator >= numerator
+                movs    cnt, num, lsr #16       @ return if den >= num << 16
+                bne     cont
+                cmp     den, num, lsl #16
+                bhs     numLeDen
+
+cont:           
+@ test if denominator is a power of two
+                tst     den, mod                @ if(den & (den - 1) == 0)
+                beq     powerOf2                @ den is power of 2
+@ count leading zeros
+                stmfd   sp!, {r4}               @ push r4 (quo) onto the stack
+                mov     cnt, #28                @ count difference in leading zeros
+                mov     mod, num, lsr #4        @ between num and den
+                cmp     den, mod, lsr #12
+                subls   cnt, cnt, #16
+                movls   mod, mod, lsr #16
+                cmp     den, mod, lsr #4
+                subls   cnt, cnt, #8
+                movls   mod, mod, lsr #8
+                cmp     den, mod
+                subls   cnt, cnt, #4
+                movls   mod, mod, lsr #4
+@ shift numerator left by cnt bits
+                mov     num, num, lsl cnt       @ mod:num = num << cnt
+                mov     quo, #0
+                rsb     den, den, #0            @ negate den for divide loop
+@ skip cnt iterations in the divide loop
+                adds    num, num, num           @ start: num = mod:num / den
+                add     pc, pc, cnt, lsl #4     @ skip cnt x 4 x 4 iterations
+                nop                             @ nop instruction takes care of pipeline
+@ inner loop unrolled x 48
+
+                .macro  divm                            @ to make translation from ARM assembler
+                adcs    mod, den, mod, lsl #1   @ to GNU assembler easier.
+                subcc   mod, mod, den
+                adc     quo, quo, quo
+                adds    num, num, num
+                .endm   
+
+                .macro  divm10  
+                divm    
+                divm    
+                divm    
+                divm    
+                divm    
+                divm    
+                divm    
+                divm    
+                divm    
+                divm    
+                .endm   
+
+                divm10                          @ 10 Unroll 47 times...
+                divm10                          @ 20
+                divm10                          @ 30
+                divm10                          @ 40
+                divm                            @ 41
+                divm                            @ 42
+                divm                            @ 43
+                divm                            @ 44
+                divm                            @ 45
+                divm                            @ 46
+                divm                            @ 47
+
+                adcs    mod, den, mod, lsl #1
+                subcc   mod, mod, den
+                adc     quo, quo, quo           @ negate quotient if signed
+                cmp     sign, #0                @ negate quotient if sign < 0
+                mov     num, quo
+                rsbmi   num, num, #0
+                ldmfd   sp!, {r4}               @ pop r4 (quo) off the stack
+                bx      lr                      @ return
+@ divide by zero handler
+div0:           
+                mov     num, #0
+                bx      lr                      @ return
+@ divide by one handler
+div1:           
+                cmp     sign, #0
+                mov     num, num, lsl #16
+                rsbmi   num, num, #0
+                bx      lr                      @ return
+
+@ numerator less than or equal to denominator handler
+numLeDen:       
+                mov     num, #0                 @ quotient = 0 if num < den
+                moveq   num, sign, asr #31      @ negate quotient if sign < 0
+                orreq   num, num, #1            @ quotient = 1 if num == den
+                bx      lr                      @ return
+
+@ power of two handler
+powerOf2:       
+                mov     cnt, #0
+                cmp     den, #(1 << 16)
+                movhs   cnt, #16
+                movhs   den, den, lsr #16
+                cmp     den, #(1 << 8)
+                addhs   cnt, cnt, #8
+                movhs   den, den, lsr #8
+                cmp     den, #(1 << 4)
+                addhs   cnt, cnt, #4
+                movhs   den, den, lsr #4
+                cmp     den, #(1 << 2)
+                addhi   cnt, cnt, #3
+                addls   cnt, cnt, den, lsr #1
+                rsb     mod, cnt, #32
+                mov     den, num, lsr #16       @ den:num = num << 16
+                mov     num, num, lsl #16
+                mov     num, num, lsr cnt       @ num = num >> cnt | den << mod
+                orr     num, num, den, lsl mod
+                cmp     sign, #0
+                rsbmi   num, num, #0            @ negate quotient if sign < 0
+                bx      lr                      @ return
+
+@ --------------------------------------------------------------------------------------------
+@ int fpmult(int a, int b)
+fpmult:         @ scaled fixed-point multiply
+                smull   r2, r3, r0, r1
+                mov     r0, r2, lsr #16
+                orr     r0, r0, r3, lsl #16
+                bx      lr                      @ return
+
+@ --------------------------------------------------------------------------------------------
+@ 32-bit DIV and REM from 'ARM System Developer's Guide'
+@ Copyright (c) 2003, Andrew N. Sloss, Dominic Symes, Chris Wright
+@ All rights reserved.
+
+d               .req    r0                      @ input denominator d, output quotient
+r               .req    r1                      @ input numerator n, output remainder
+t               .req    r2                      @ scratch register
+q               .req    r3                      @ current quotient
+
+udiv:           
+                mov     q, #0                   @ zero quotient
+                rsbs    t, d, r, lsr#3          @ if ((r>>3)>=d) C=1 else C=0
+                bcc     div_3bits               @ quotient fits in 3 bits
+                rsbs    t, d, r, lsr#8          @ if ((r>>8)>=d) C=1 else C=0
+                bcc     div_8bits               @ quotient fits in 8 bits
+                mov     d, d, lsl#8             @ d = d*256
+                orr     q, q, #0xFF000000       @ make div_loop iterate twice
+                rsbs    t, d, r, lsr#4          @ if ((r>>4)>=d) C=1 else C=0
+                bcc     div_4bits               @ quotient fits in 12 bits
+                rsbs    t, d, r, lsr#8          @ if ((r>>8)>=d) C=1 else C=0
+                bcc     div_8bits               @ quotient fits in 16 bits
+                mov     d, d, lsl#8             @ d = d*256
+                orr     q, q, #0x00FF0000       @ make div_loop iterate 3 times
+                rsbs    t, d, r, lsr#8          @ if ((r>>8)>=d)
+                movcs   d, d, lsl#8             @ { d = d*256
+                orrcs   q, q, #0x0000FF00       @ make div_loop iterate 4 times}
+                rsbs    t, d, r, lsr#4          @ if ((r>>4)<d)
+                bcc     div_4bits               @   r/d quotient fits in 4 bits
+                rsbs    t, d, #0                @ if (0 >= d)
+                bcs     div_by_0                @   goto divide by zero trap
+@ fall through to the loop with C=0
+div_loop:       
+                movcs   d, d, lsr#8             @ if (next loop) d = d/256
+div_8bits:      @ calculate 8 quotient bits
+                rsbs    t, d, r, lsr#7          @ if ((r>>7)>=d) C=1 else C=0
+                subcs   r, r, d, lsl#7          @ if (C) r -= d<<7
+                adc     q, q, q                 @ q=(q<<1)+C
+                rsbs    t, d, r, lsr#6          @ if ((r>>6)>=d) C=1 else C=0
+                subcs   r, r, d, lsl#6          @ if (C) r -= d<<6
+                adc     q, q, q                 @ q=(q<<1)+C
+                rsbs    t, d, r, lsr#5          @ if ((r>>5)>=d) C=1 else C=0
+                subcs   r, r, d, lsl#5          @ if (C) r -= d<<5
+                adc     q, q, q                 @ q=(q<<1)+C
+                rsbs    t, d, r, lsr#4          @ if ((r>>4)>=d) C=1 else C=0
+                subcs   r, r, d, lsl#4          @ if (C) r -= d<<4
+                adc     q, q, q                 @ q=(q<<1)+C
+div_4bits:      @ calculate 4 quotient bits
+                rsbs    t, d, r, lsr#3          @ if ((r>>3)>=d) C=1 else C=0
+                subcs   r, r, d, lsl#3          @ if (C) r -= d<<3
+                adc     q, q, q                 @ q=(q<<1)+C
+div_3bits:      @ calculate 3 quotient bits
+                rsbs    t, d, r, lsr#2          @ if ((r>>2)>=d) C=1 else C=0
+                subcs   r, r, d, lsl#2          @ if (C) r -= d<<2
+                adc     q, q, q                 @ q=(q<<1)+C
+                rsbs    t, d, r, lsr#1          @ if ((r>>1)>=d) C=1 else C=0
+                subcs   r, r, d, lsl#1          @ if (C) r -= d<<1
+                adc     q, q, q                 @ q=(q<<1)+C
+                rsbs    t, d, r                 @ if (r>=d) C=1 else C=0
+                subcs   r, r, d                 @ if (C) r -= d
+                adcs    q, q, q                 @ q=(q<<1)+C; C=old q bit 31
+div_next:       
+                bcs     div_loop                @ loop if more quotient bits
+                mov     r0, q                   @ r0 = quotient; r1=remainder
+                bx      lr                      @ return { r0, r1 } structure
+div_by_0:       
+                mov     r0, #-1
+                mov     r1, #-1
+                bx      lr                      @ return { r0, r1 } structure
+
+@ --------------------------------------------------------------------------------------------
+sdiv:           
+                stmfd   sp!, {lr}
+                ands    sign, d, #1<<31         @ sign=(d<0 ? 1<<31 : 0)
+                rsbmi   d, d, #0                @ if (d<0) d=-d
+                eors    sign, sign, r, asr#32   @ if (r<0) sign=~sign
+                rsbcs   r, r, #0                @ if (r<0) r=-r
+                bl      udiv                    @ (d,r)=(r/d,r%d)
+                movs    sign, sign, lsl#1       @ C=sign[31], N=sign[30]
+                rsbcs   d, d, #0                @ if (sign[31]) d=-d
+                rsbmi   r, r, #0                @ if (sign[30]) r=-r
+                ldmfd   sp!, {pc}               @ return { r0, r1 } structure
+
+@ --------------------------------------------------------------------------------------------
+empty:          
+                bx      lr                      @ return
+
+
+
+@-------------------------------------------------------------------------------
+@ damsonlib system calls
+@-------------------------------------------------------------------------------
+
+
+@ --------------------------------------------------------------------------------------------
+plot:           @ to be written
+                bx      lr                      @ return
+
+@ --------------------------------------------------------------------------------------------
+@ void delay(uint* delay_seconds)
+@ Delay must disable interrupts and save the PCB state. The scratch registers (r0-r3 and r12) 
+@ do not have to be saved. The saved PC is the LR hence, restore has the effect of returning to 
+@ the calling function.
+delay:
+                msr	cpsr_c, #0xdf		@ MODE CHANGE: system mode with FIQ and IRQ DISABLED
+                		
+                ldr 	r12, =CURRENT_PCB	@ load current pcb address
+		ldr 	r12, [r12]		@ load current pcb
+                
+                add	r12, #20		@ offset r12 to saved r0 register
+                stmia	r12, {r4-r10}		@ store the working registers to the current PCB (r0 to r3 are temp so ignore)
+		sub 	r12, #20		@ set r12 back to beginning of PCB
+                str	lr, [r12, #12]		@ save the interrupted instruction stored in lr to pc
+                mrs	r4, spsr		@ move the save program status register	to r4
+                str	r4, [r12, #16]		@ save the psr to the current PCB
+                stmia	r12, {fp, sp, lr}	@ store fp, sp and lr to the current PCB
+
+		b	c_handle_delay			@ branch to c function to handle delay
+
+
+@ --------------------------------------------------------------------------------------------
+setclk:         @ to be written
+                bx      lr                      @ return
+
+@ --------------------------------------------------------------------------------------------
+
+signal:         @ to be written
+                bx      lr                      @ return
+
+@ --------------------------------------------------------------------------------------------
+wait:           @ to be written
+                bx      lr                      @ return
+
+@ --------------------------------------------------------------------------------------------
+createthread:   @ to be written
+                bx      lr                      @ return
+
+@ --------------------------------------------------------------------------------------------
+deletethread:   @ to be written
+                bx      lr                      @ return
+
+@ --------------------------------------------------------------------------------------------
+getclk:         @ to be written
+                bx      lr                      @ return
+
+
+@-------------------------------------------------------------------------------
+
+tickrate:       
+                push    {lr}                    @ Call c_main's tickrate
+                bl      c_tickrate
+                pop     {pc}
+
+@-------------------------------------------------------------------------------
+
+sendpkt:        
+                push    {lr}
+                mov     r2, r1                  @ 3rd arg data
+                mov     r1, r0                  @ 2nd arg port
+                ldr     r0, =NODE_ID      	@ 1st arg node id
+                ldr	r0, [r0]
+                bl      c_sendpkt
+                pop     {pc}
+
+@-------------------------------------------------------------------------------
+
+putbyte:        
+                strb    r2, [r1, r0]
+                bx      lr
+
+@-------------------------------------------------------------------------------
+
+getbyte:        
+                ldrb    r0, [r1, r0]
+                bx      lr
+
+@-------------------------------------------------------------------------------
+
+putword:        
+                str     r2, [r0, r1, lsl #2]
+                bx      lr
+
+@-------------------------------------------------------------------------------
+
+getword:        
+                ldr     r0, [r0, r1, lsl #2]
+                bx      lr
+
+@-------------------------------------------------------------------------------
+
+vcopy:          
+                ldr     r3, [r1], #4            @ copy local array
+                str     r3, [r0], #4
+                subs    r2, r2, #1
+                bgt     vcopy
+                bx      lr
+
+@ --------------------------------------------------------------------------------------------
+@ void readsdram(void* system_address, void* local_address, int words)
+@ Read SDRAM must disable interrupts and save the PCB state. The scratch registers (r0-r3 and r12) 
+@ do not have to be saved as. The saved PC is the LR hence, restore has the effect of returning to 
+@ the calling function. Before calling c_handle_sdtransfer function the read direction value (0) 
+@ is saved in register r3 (4th argument).
+readsdram:
+                msr	cpsr_c, #0xdf		@ MODE CHANGE: system mode with FIQ and IRQ DISABLED
+                		
+                ldr 	r12, =CURRENT_PCB	@ load current pcb address
+		ldr 	r12, [r12]		@ load current pcb
+                
+                add	r12, #20		@ offset r12 to saved r0 register
+                stmia	r12, {r4-r10}		@ store the working registers to the current PCB (r0 to r3 are temp so ignore)
+		sub 	r12, #20		@ set r12 back to beginning of PCB
+                str	lr, [r12, #12]		@ save the interrupted instruction stored in lr to pc
+                mrs	r4, spsr		@ move the save program status register	to r4
+                str	r4, [r12, #16]		@ save the psr to the current PCB
+                stmia	r12, {fp, sp, lr}	@ store fp, sp and lr to the current PCB
+
+		mov	r3, #0			@ set transfer direction to READ (0)
+		b	c_handle_sdtransfer	@ branch to c function to handle transfer
+
+		
+
+@ --------------------------------------------------------------------------------------------
+@ void writesdram(void* system_address, void* local_address, int words)
+@ Identical to readsdram except that the write direction value (1) is specified in r3.
+writesdram:     @ to be written
+                msr	cpsr_c, #0xdf		@ MODE CHANGE: system mode with FIQ and IRQ DISABLED
+                		
+                ldr 	r12, =CURRENT_PCB	@ load current pcb address
+		ldr 	r12, [r12]		@ load current pcb
+                
+                add	r12, #20		@ offset r12 to saved r0 register
+                stmia	r12, {r4-r10}		@ store the working registers to the current PCB (r0 to r3 are temp so ignore)
+		sub 	r12, #20		@ set r12 back to beginning of PCB
+                str	lr, [r12, #12]		@ save the interrupted instruction stored in lr to pc
+                mrs	r4, spsr		@ move the save program status register	to r4
+                str	r4, [r12, #16]		@ save the psr to the current PCB
+                stmia	r12, {fp, sp, lr}	@ store fp, sp and lr to the current PCB
+
+		mov	r3, #1			@ set transfer direction to WRITE (1)
+		b	c_handle_sdtransfer	@ branch to c function to handle transfer
+
+@ --------------------------------------------------------------------------------------------
+syncnodes:      @ to be written
+                bx      lr                      @ return
+
+                
+             
+@-------------------------------------------------------------------------------
+@ Call io_printf (limited to 10 args, including format)
+dprintf:        
+                push    {r4-r11, lr}            @ Save DAMSON env on C stack
+
+                add     r4, r4, #28             @ Point to args 5-10
+                ldmia   r4, {r5-r10}            @ Get them to r5-gv
+
+                sub     sp, sp, #28             @ Adjust C stack for 7 args
+                stmia   sp, {r3, r5-r10}        @ and save args 4-10 on stack
+
+                mov     r3, r2                  @ Shuffle first 3 args
+                mov     r2, r1
+                mov     r1, r0
+                mov     r0, #0                  @ !! IO_STD stream constant
+
+                bl      io_printf               @ ST's version of printf
+
+                add     sp, sp, #28             @ Adjust C stack for 7 args
+                pop     {r4-r11, pc}            @ Restore DAMSON env & return
+
+
+
+
+
+
+@-------------------------------------------------------------------------------
+@ DAMSON runtime functions
+@-------------------------------------------------------------------------------
+
+@-------------------------------------------------------------------------------
+@ initialise the damson global vector and returns to the C environment
+init_damsonlib:
+                push    {r4-r11, lr}            @ Save registers
+                ldr     gv, =DAMSON_GV_START    @ load the address of gv
+                ldr	gv, [gv]
+                          
+                ldr     r5, =sdiv               @ global(1) = sdiv
+                str     r5, [gv, #4*1]
+                ldr     r5, =fpmult             @ global(2) = fpmult
+                str     r5, [gv, #4*2]
+                ldr     r5, =fpdiv              @ global(3) = fpdiv
+                str     r5, [gv, #4*3]
+                ldr     r5, =vcopy              @ global(4) = vcopy
+                str     r5, [gv, #4*4]
+                ldr     r5, =sendpkt            @ global(11) = sendpkt
+                str     r5, [gv, #4*11]
+                ldr     r5, =delay              @ global(12) = delay
+                str     r5, [gv, #4*12]
+                ldr     r5, =dprintf            @ global(13) = printf
+                str     r5, [gv, #4*13]
+                ldr     r5, =c_damsonexit         @ global(14) = exit
+                str     r5, [gv, #4*14]
+                ldr     r5, =signal             @ global(15) = signal
+                str     r5, [gv, #4*15]
+                ldr     r5, =wait               @ global(16) = wait
+                str     r5, [gv, #4*16]
+                ldr     r5, =tickrate           @ global(17) = tickrate
+                str     r5, [gv, #4*17]
+		@ ldr     r5, =putbyte            ; global(18) = putbyte (coded in-line)
+		@ str     r5, [gv, #4*18]
+		@ ldr     r5, =putword            ; global(19) = putword (coded in-line)
+		@ str     r5, [gv, #4*19]
+                ldr     r5, =readsdram          @ global(20) = readsdram
+                str     r5, [gv, #4*20]
+                ldr     r5, =writesdram         @ global(21) = writesdram
+                str     r5, [gv, #4*21]
+                ldr     r5, =c_syncnodes          @ global(22) = c_syncnodes
+                str     r5, [gv, #4*22]
+
+                ldr     r5, =getclk             @ global(31) = getclk
+                str     r5, [gv, #4*31]
+                ldr     r5, =createthread       @ global(34) = createthread
+                str     r5, [gv, #4*34]
+                ldr     r5, =deletethread       @ global(35) = deletethread
+                str     r5, [gv, #4*35]
+		@ ldr     r5, =getbyte            ; global(36) = getbyte (coded in-line)
+		@ str     r5, [gv, #4*36]
+		@ ldr     r5, =getword            ; global(37) = getword (coded in-line)
+		@ str     r5, [gv, #4*37]
+		@ ldr     r5, =bitset             ; global(38) = bitset (coded in-line)
+		@ str     r5, [gv, #4*38]
+	
+
+                @ RESET THE FIQ STACK (required for sync which runs before damson starts)
+                msr	cpsr_c, #0xd1		@ MODE CHANGE: FIQ mode with FIQ and IRQ DISABLED
+                ldr 	sp, =I_STACK_END	@ reset the sp to end of interrupt stack (as it is a descending stack)
+                ldr	sp, [sp]
+
+		@ RESET THE IRQ STACK (shoudlnt be required)
+		msr	cpsr_c, #0xd2		@ MODE CHANGE: IRQ mode with FIQ and IRQ DISABLED
+		ldr 	sp, =I_STACK_END	@ reset the sp to end of interrupt stack (as it is a descending stack)
+		ldr	sp, [sp]
+		
+		@restore cpsr in r0 and return
+		msr	cpsr_c, #0xdf		@ MODE CHANGE: SYSTEM mode with FIQ and IRQ DISABLED (for barrier)	
+
+		pop     {r4-r11, pc}            @ Return to C env restoring regs
+  
+@-------------------------------------------------------------------------------  
+@ void restore_process(struct PCB *pcb);  
+@ After a reschedule the last thing to happen is that the process is restored using this procedure.
+@ Before restoring the stack pointer for FIQ and IRQ modes are reset. This is because any interrupt 
+@ which has lead to a reschedule will not unwind the C stack, it will simply find and restore the 
+@ first active process. It is assumed that the PCB has saved all registers. A push operation is 
+@ required to save the target PC whilst the other registers are restored. The final pop restores 
+@ the SP and jumps to the correct code location.
+
+restore_process:               
+        
+	        @ RESET THE FIQ STACK
+                msr	cpsr_c, #0xd1		@ MODE CHANGE: FIQ mode with FIQ and IRQ DISABLED
+                ldr 	sp, =I_STACK_END	@ reset the sp to end of interrupt stack (as it is a descending stack)
+                ldr	sp, [sp]
+
+		@ RESET THE IRQ STACK
+		msr	cpsr_c, #0xd2		@ MODE CHANGE: IRQ mode with FIQ and IRQ DISABLED
+	        ldr 	sp, =I_STACK_END	@ reset the sp to end of interrupt stack (as it is a descending stack)
+	        ldr	sp, [sp]
+		
+		msr	cpsr_c,  #0xdf		@ MODE CHANGE: SYSTEM mode with FIQ and IRQ DISABLED   
+                
+                @ RESTORE FROM SAVED PCB
+		ldr	r1, [r0, #16]		@ load saved psr into r1
+		msr	cpsr_xsf, r1		@ restore the flags, status and extension bits of cpsr (NOT control) 
+                   
+                ldmia	r0, {fp, sp, lr}	@ save fp, sp and lr to local registers
+                ldr	r1, [r0, #12]		@ load pc to r1
+        	push	{r1}			@ push the pc to stack
+                
+                add	r0, #20			@ increment pcb address by 20 to get to r0
+                ldmia	r0, {r0-r10, r12}	@ restore register r0 to r10 and r12                                     
+               
+                msr	cpsr_c, #0x1f		@ ENABLE INTERRUPTS: SYSTEM mode with FIQ and IRQ ENABLED                         	          
+                                          	                                              
+                pop	{pc}			@ restore pc
+
+@-------------------------------------------------------------------------------  
+@ void end_process(void)             
+@ DAMSON function which restores the process handle from the current damson stack frame
+@ and calls delete process. The end process function is always added as the top frame in the
+@ DAMSON stack so all new processes will end up here. Note: Interrupts are disabled when the 
+@ processes has completed to allows c_delete_process to call reschedule un-interrupted.
+end_process:
+		msr	cpsr_c, #0xdf		@ MODE CHANGE: system mode with FIQ and IRQ DISABLED
+		ldr     r0, [fp, #12]		@ load the process handle from the frame
+		b	c_delete_process	@ delete process r0=handle
+
+		
+@-------------------------------------------------------------------------------
+@ void timer_interrupt()   
+@ The timer_interrupt function is the default handler for timer interrupts in IRQ mode. On entry the SP 
+@ will have been reset by which ever processes was last restored.  The stack is required to save r12 
+@ before it it used to load the CURRENT_PCB to check for an active processes. If there is an active process 
+@ the registers are saved to the PCB and the timer is handled by c_handle_timer. If there is no active 
+@ process the timer is handled straight away.  
+timer_interrupt:
+		msr	cpsr_c, #0xd2		@ MODE CHANGE: IRQ mode with FIQ and IRQ DISABLED (must turn interrupts off)
+		
+		push 	{r12}			@ save r12
+		ldr 	r12, =CURRENT_PCB	@ load current pcb address
+		ldr 	r12, [r12]		@ load current pcb
+
+		cmp     r12, #0                 @ test if there is an active process
+                beq     c_handle_timer		@ go straight to c handle if no process to save otherwise continue
+                
+                add	r12, #20		@ offset r12 to saved r0 register
+                stmia	r12, {r0-r10}		@ store the working registers to the current PCB 
+		sub 	r12, #20		@ set r12 back to beginning of PCB
+                sub 	lr, #4			@ offset the lr by 4 to get interrupted instruction
+                str	lr, [r12, #12]		@ save the interrupted instruction stored in lr to pc
+                mrs	r0, spsr		@ move the save program status register	to r0
+                str	r0, [r12, #16]		@ save the psr to the current PCB
+
+		msr	cpsr_c, #0xdf		@ MODE CHANGE: system mode with FIQ and IRQ DISABLED
+                stmia	r12, {fp, sp, lr}	@ store fp, sp and lr to the current PCB
+		msr	cpsr_c, #0xd2		@ MODE CHANGE: IRQ mode with FIQ and IRQ DISABLED
+		
+		mov	r1, r12			@ move pcb address to r1
+		pop	{r12}			@ restore r12
+		str	r12, [r1, #64]		@ save r12 to pcb
+
+		b	c_handle_timer		@ branch to c function to handle timer interrupt
+		
+		
+dma_interrupt:
+		msr	cpsr_c, #0xd2		@ MODE CHANGE: IRQ mode with FIQ and IRQ DISABLED (must turn interrupts off)
+		push 	{r12}			@ save r12
+		ldr 	r12, =CURRENT_PCB	@ load current pcb address
+		ldr 	r12, [r12]		@ load current pcb
+
+		cmp     r12, #0                 @ test if there is an active process
+                beq     c_handle_sdcomplete	@ go straight to c handle if no process to save otherwise continue
+                
+                add	r12, #20		@ offset r12 to saved r0 register
+                stmia	r12, {r0-r10}		@ store the working registers to the current PCB 
+		sub 	r12, #20		@ set r12 back to beginning of PCB
+                sub 	lr, #4			@ offset the lr by 4 to get interrupted instruction
+                str	lr, [r12, #12]		@ save the interrupted instruction stored in lr to pc
+                mrs	r0, spsr		@ move the save program status register	to r0
+                str	r0, [r12, #16]		@ save the psr to the current PCB
+
+		msr	cpsr_c, #0xdf		@ MODE CHANGE: system mode with FIQ and IRQ DISABLED
+                stmia	r12, {fp, sp, lr}	@ store fp, sp and lr to the current PCB
+		msr	cpsr_c, #0xd2		@ MODE CHANGE: IRQ mode with FIQ and IRQ DISABLED
+		
+		mov	r1, r12			@ move pcb address to r1
+		pop	{r12}			@ restore r12
+		str	r12, [r1, #64]		@ save r12 to pcb
+
+		b	c_handle_sdcomplete	@ branch to c function to handle timer interrupt
+
+@-------------------------------------------------------------------------------
+@ void packet_interrupt()       
+@ The packet_interrupt function is the default handler for mc packet interrupts in FIQ mode. On entry the SP 
+@ will have been reset by which ever processes was last restored. There are two types of MC packet, either a sync
+@ packet with a special key value (greater than 0x1ffff << 11 ) or a DAMSON packet with a node id in the range
+@ of ((0x1ffff << 11)>>8)-1 = 1048567. IMPORTANT: Any node ids greater than the max id of 104856 may be confused
+@ as sync packets! This function checks the key value to determine which handler is appropriate. In the case
+@ of a DAMSON packet the CURRENT_PCB is tested to see if there is an active process. Is there is then all
+@ registers are saved to the PCB before the packet is handled.
+packet_interrupt:
+		msr	cpsr_c, #0xd1		@ MODE CHANGE: FIQ mode with FIQ and IRQ DISABLED (must turn interrupts off)
+		mov	r8, #CC_BASE		@ load cc base
+		ldr	r9, [r8, #CC_RXKEY]	@ load rx key to r0
+		ldr	r8, =SYNC_PKT		@ load sync pkt const into r8 (TODO: construct this if possible)
+		cmp	r9, r8			@ compare with SYNC_PKT to see if it is a barrier or normal mc packet
+		
+		bge	.SYNCPKT		@ goto handle sync packet otherwise continue with damson interrupt
+
+		ldr 	r12, =CURRENT_PCB	@ load current pcb address
+		ldr 	r12, [r12]		@ load current pcb
+		cmp     r12, #0                 @ test if there is an active process
+                beq     .DPKT			@ go straight to c handle if no process to save otherwise continue
+	
+		add	r12, #20		@ offset pcb to saved r0 register
+                stmia	r12, {r0-r7}		@ store the shared working registers of current mode to the current PCB 
+		sub 	r1,  r12, #20		@ set r1 to the beginning of PCB (r1 is accessible in all modes)
+	        
+	        sub 	lr, #4			@ offset the lr by 4 to get interrupted instruction
+                str	lr, [r1, #12]		@ save the interrupted instruction stored in lr to pc
+                mrs	r0, spsr		@ move the save psr to r0
+                str	r0, [r1, #16]		@ save the psr to the current PCB
+                
+	 	msr	cpsr_c, #0xdf		@ MODE CHANGE: SYSTEM mode with FIQ and IRQ DISABLED
+                stmia	r1, {fp, sp, lr}	@ store fp, sp and lr to the current PCB
+                add	r1, #52			@ offset pcb to saved r8 register
+                stmia	r1, {r8-r10, r12}	@ store the working registers to the current PCB 
+		msr	cpsr_c, #0xd1		@ MODE CHANGE: FIQ mode with FIQ and IRQ DISABLED
+                		
+.DPKT:
+		mov 	r0, r9			@ save the key to r0
+		b	c_handle_packet		@ branch to c function to handle timer interrupt	
+.SYNCPKT:
+		push 	{r0-r3, lr}		@ save the environment registers not banked in FIQ mode
+		mov 	r0, r9			@ save the key to r0
+		bl	sync_handle_packet	@ goto sync handle function and return 
+		pop     {r0-r3, lr}		@ restore the environment
+		subs    pc, lr, #4		@ mode restore and return back to what ever we were doing (this will be to a lock in barrier_wait)
+
+@-------------------------------------------------------------------------------
+@ void syncnodes_packet_interrupt()  
+@ This is the same as packet_interrupt but DAMSON packets are ignored. This is required during a syncnodes call
+@ to ensure DAMSON MC packets are ignored until the sync has completed. Once completed the VIC restores the standard 
+@ packet_interrupt function. Its important that the original packet_interrupt can also handle sync packets as sync 
+@ messages may be received from other nodes before the current core reaches the syncnodes call,
+syncnodes_packet_interrupt:
+		msr	cpsr_c, #0xd1		@ MODE CHANGE: FIQ mode with FIQ and IRQ DISABLED (must turn interrupts off)
+		mov	r8, #CC_BASE		@ load cc base
+		ldr	r9, [r8, #CC_RXKEY]	@ load rx key to r0
+		ldr	r8, =SYNC_PKT		@ load sync pkt const into r8 (TODO: construct this if possible)
+		cmp	r9, r8			@ compare with SYNC_PKT to see if it is a barrier or normal mc packet
+		
+		bge	.SYNCPKT		@ goto handle sync packet otherwise continue with damson interrupt
+
+		subs    pc, lr, #4		@ ignore damson packet return to what ever we were doing
+
+
+					
+
+@-------------------------------------------------------------------------------
+@ void wait_for_irq()
+@ Puts the processor in sleep mode. Should never return as it should only ever be interrupted!
+sleep:
+		msr	cpsr_c, #0x1f		@ go to system mode with FIQ and IRQ enabled
+		mcr 	p15, 0, r0, c7, c0, 4
+		b  	sleep
+
+
+@-------------------------------------------------------------------------------
+@ some useful debug functions. Not used by runtime when its working!
+@-------------------------------------------------------------------------------
+
+
+@-------------------------------------------------------------------------------
+@ void enable_interrupts()
+@ This function clears the F (0x80) and I (0x40) bits in the CPSR in order to disable 
+@ FIQ and IRQ interrupts in the processor.
+enable_interrupts:
+    		mrs	r0, cpsr 		@ save state of cpsr in r0 
+     		bic	r1, r0, #0xc0 		@ clear the FIQ and IRQ bits
+     		msr	cpsr_c, r1 		@ store the new status
+     		bx	lr			@ return
+	
+@-------------------------------------------------------------------------------
+@ uint disable_interrupts()
+@ This function sets the F (0x80) and I (0x40) bits in the CPSR in order to disable 
+@ FIQ and IRQ interrupts in the processor. The original cpsr value is returned
+disable_interrupts:
+    		mrs	r0, cpsr 		@ save state of cpsr in r0 
+     		orr	r1, r0, #0xc0 		@ set the FIQ and IRQ bits to disable
+     		msr	cpsr_c, r1 		@ store the new status
+     		bx	lr			@ return
+     		
+@-------------------------------------------------------------------------------
+@ void restore_cpsr(uint cpsr)
+@ This function restores the cpsr to a saved value
+restore_cpsr:
+     		msr	cpsr_c, r0 		@ store the new status
+     		bx	lr			@ return
+
+@-------------------------------------------------------------------------------
+@ uint get_cpsr()
+@ returns the current value of the cpsr register   		
+get_cpsr:
+		mrs     r0, cpsr
+		bx 	lr
+@-------------------------------------------------------------------------------
+@ uint get_sp()
+@ returns the current value of the sp register  		
+get_sp:
+		mov 	r0, sp
+		bx 	lr
+
+
+

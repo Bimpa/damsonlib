@@ -1,0 +1,47 @@
+/*
+ * SUMMARY
+ *  GNU linker script for building the damson runtime library
+ *
+ * AUTHORS
+ *  Paul Richmond - p.richmond@sheffield.ac.uk
+ *
+ *
+ * COPYRIGHT
+ *  Copyright (c) The University of Sheffield, 2013. All rights reserved.
+ *  BIMPA Project
+ */
+ 
+
+SECTIONS
+{
+    ITCM_BASE = 0x00000000;
+    DTCM_BASE = 0x00400000;
+
+    . = ITCM_BASE;
+
+    OVERLAY 0 : AT (0)
+    {
+    	DLIB_APLX { * (sark_aplx); }
+
+    	DLIB_RO_DATA
+    	{
+              * (sark_init);
+              * (sark_alib);
+              * (.text);
+              * (.rodata*);
+              * (sark_align);
+    	}
+    }
+
+    . = DTCM_BASE;
+
+    DLIB_RW_DATA : { * (.data); }
+
+    . = ALIGN (4);
+
+    DLIB_ZI_DATA : { * (.bss); * (COMMON); }
+
+    . = ALIGN (4);
+
+
+}

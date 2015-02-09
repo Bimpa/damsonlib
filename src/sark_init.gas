@@ -1,0 +1,627 @@
+@/*
+@ * SUMMARY
+@ *  Initialisation & assembly code for SARK
+@ *
+@ * AUTHORS
+@ *  Steve Temple (University of Manchester) - temples@cs.man.ac.uk
+@ *  Modified by Paul Richmond (University of Sheffield) - p.richmond@sheffield.ac.uk
+@ *
+@ *
+@ * COPYRIGHT
+@ *  Copyright (C)    The University of Manchester - 2010, 2011
+@ *  SpiNNaker Project
+@ */
+                .include "spinnaker.gas"
+
+
+@------------------------------------------------------------------------------
+
+@ Run time error codes - should move to spinnaker.h....
+
+                .equ    RTE_RESET, 0x10
+                .equ    RTE_UNDEF, 0x11
+                .equ    RTE_SVC, 0x12
+                .equ    RTE_PABT, 0x13
+                .equ    RTE_DABT, 0x14
+                .equ    RTE_ADDR, 0x15
+                .equ    RTE_IRQ, 0x16
+                .equ    RTE_FIQ, 0x17
+
+
+@------------------------------------------------------------------------------
+
+                .section sark_aplx
+
+                .ifdef  GNU
+
+                .global RO_TO
+                .global RO_FROM
+                .global RO_LENGTH
+                .global RW_TO
+                .global RW_FROM
+                .global RW_LENGTH
+                .global ZI_TO
+                .global ZI_LENGTH
+
+aplx_table:     .word   APLX_RCOPY
+                .word   RO_TO
+                .word   RO_FROM
+                .word   RO_LENGTH
+
+                .word   APLX_RCOPY
+                .word   RW_TO
+                .word   RW_FROM
+                .word   RW_LENGTH
+
+                .word   APLX_FILL
+                .word   ZI_TO
+                .word   ZI_LENGTH
+                .word   0
+
+                .word   APLX_EXEC
+                .word   RO_TO
+                .word   0
+                .word   0
+                .else       
+                .global ||Image$$APLX$$RO$$Limit|| @ End of APLX block
+
+                .global ||Image$$ITCM$$RO$$Base|| @ Base/len of ITCM
+                .global ||Image$$ITCM$$RO$$Length|| @ code image
+                .global ||Image$$ITCM$$RO$$Limit|| @ code image
+
+                .global ||Image$$DTCM$$RW$$Base|| @ Base/len of DTCM
+                .global ||Image$$DTCM$$RW$$Length|| @ RW data
+
+                .global ||Image$$DTCM$$ZI$$Base|| @ Base/len of DTCM
+                .global ||Image$$DTCM$$ZI$$Length|| @ ZI data
+
+aplx_table:     .word   APLX_RCOPY
+                .word   ||Image$$ITCM$$RO$$Base|| @ Copy to
+                .word   ||Image$$APLX$$RO$$Limit|| - aplx_table @ Copy from
+                .word   ||Image$$ITCM$$RO$$Length|| @ Copy length
+
+aplx_1:         .word   APLX_RCOPY
+                .word   ||Image$$DTCM$$RW$$Base||
+                .word   ||Image$$APLX$$RO$$Limit|| + ||Image$$ITCM$$RO$$Length|| - aplx_1
+                .word   ||Image$$DTCM$$RW$$Length||
+
+                .word   APLX_FILL
+                .word   ||Image$$DTCM$$ZI$$Base|| @ Zero init area
+                .word   ||Image$$DTCM$$ZI$$Length||
+                .word   0
+
+                .word   APLX_EXEC
+                .word   ||Image$$ITCM$$RO$$Base|| @ Start address
+                .word   0
+                .word   0
+                .endif      
+
+@------------------------------------------------------------------------------
+
+                .section sark_init
+
+                .global sark_setup
+                .global sark_error
+                .global svc_putc
+                .global restore_sark
+
+@------------------------------------------------------------------------------
+
+                ldr     pc, reset_vec           @ Reset
+                ldr     pc, undef_vec           @ Undefined instr
+                ldr     pc, svc_vec             @ SVC
+                ldr     pc, pabt_vec            @ Prefetch abort
+                ldr     pc, dabt_vec            @ Data abort
+                ldr     pc, addr_vec            @ (Address exception)
+                ldr     pc, [pc, #-0xff0]       @ IRQ (via VIC)
+                ldr     pc, fiq_vec             @ FIQ
+
+reset_vec:      .word   reset_han
+undef_vec:      .word   undef_err
+svc_vec:        .word   svc_han
+pabt_vec:       .word   pabt_err
+dabt_vec:       .word   dabt_err
+addr_vec:       .word   addr_err
+irq_vec:        .word   irq_err
+fiq_vec:        .word   fiq_err
+
+                .equ    RTS_STACK, 4096
+                .equ    C_STACK, DTCM_TOP-RTS_STACK      @; C code (user mode) stack
+
+reset_han:      msr     cpsr_c, #IMASK_ALL+MODE_IRQ @ IRQ mode, ints off
+                ldr     sp, =IRQ_STACK          @ Set up stack
+
+                msr     cpsr_c, #IMASK_ALL+MODE_FIQ @ FIQ mode, ints off
+                ldr     sp, =FIQ_STACK          @ Set up stack
+
+                msr     cpsr_c, #IMASK_ALL+MODE_SVC @ SVC mode, ints off
+                ldr     sp, =SVC_STACK          @ Set up stack
+
+                msr     cpsr_c, #IMASK_ALL+MODE_SYS @ SYS mode, ints off
+                ldr     sp, =C_STACK            @ Set up stack
+
+                adr     r0, reset_err
+                adr     r1, reset_vec
+                str     r0, [r1, #0]
+
+                bl      sark_setup              @ Interrupts on in here
+
+                .ifdef  SARK_API
+
+                .global rts_init
+                bl      rts_init
+
+                .endif      
+
+                .global c_main
+                bl      c_main                  @ Call C main procedure
+
+                .ifdef  SARK_API
+                
+                .global rts_cleanup
+                bl      rts_cleanup
+                
+                .endif
+
+                b       snooze
+
+
+@------------------------------------------------------------------------------
+
+restore_sark:   msr     cpsr_c, #IMASK_ALL+MODE_IRQ @ IRQ mode, ints off
+                ldr     sp, =IRQ_STACK          @ Set up stack
+                msr     cpsr_c, #IMASK_ALL+MODE_FIQ @ FIQ mode, ints off
+                ldr     sp, =FIQ_STACK          @ Set up stack
+                msr     cpsr_c, #IMASK_ALL+MODE_SVC @ SVC mode, ints off
+                ldr     sp, =SVC_STACK          @ Set up stack
+                msr     cpsr_c, #IMASK_ALL+MODE_SYS @ SYS mode, ints off
+                ldr     sp, =C_STACK            @ Set up stack
+                msr     cpsr_c, #MODE_SYS @ SYS mode, ints ON
+		b       snooze
+
+reset_err:      mov     r0, #RTE_RESET
+                b       sark_error
+
+undef_err:      mov     r0, #RTE_UNDEF
+                b       sark_error
+
+svc_err:        mov     r0, #RTE_SVC
+                b       sark_error
+
+pabt_err:       mov     r0, #RTE_PABT
+                b       sark_error
+
+dabt_err:       mov     r0, #RTE_DABT
+                b       sark_error
+
+addr_err:       mov     r0, #RTE_ADDR
+                b       sark_error
+
+irq_err:        mov     r0, #RTE_IRQ
+                b       sark_error
+
+fiq_err:        mov     r0, #RTE_FIQ
+                b       sark_error
+
+
+@------------------------------------------------------------------------------
+
+
+svc_han:        push    {r2-r3, r12, lr}        @ Save registers
+
+                mrs     r12, spsr               @ Get SPSR
+                push    {r1, r12}               @ Save SPSR, R1
+
+                tst     r12, #THUMB_BIT         @ Thumb mode?
+
+                ldrne   r12, [lr, #-2]          @ Get appropriate data
+                ldreq   r12, [lr, #-4]          @
+                ands    r12, r12, #255          @ and form SVC number
+
+                beq     svc_tube                @ SVC 0 - Tube
+                b       svc_err                 @ otherwise error
+
+svc_tube:       bl      svc_putc                @ Char in r0 to stream in r1
+
+svc_exit:       pop     {r1, r12}               @ Restore SPSR, r1
+                msr     spsr_cxsf, r12
+
+                ldmfd   sp!, {r2-r3, r12, pc}^  @ and return
+
+
+@------------------------------------------------------------------------------
+
+                .global null_int
+
+null_int:       subs    pc, lr, #4
+
+@------------------------------------------------------------------------------
+
+
+                .global cpu_int_c
+                .global cpu_int
+
+cpu_int:        sub     lr, lr, #4              @ Adjust LR_irq and save
+                push    {r0, lr}                @ with r0
+
+                mrs     lr, spsr                @ Get SPSR_irq to LR
+                push    {r12, lr}               @ Save SPSR & r12
+
+                msr     cpsr_c, #MODE_SYS       @ Go to SYS mode, interrupts enabled
+
+                push    {r1-r3, lr}             @ Save working regs and LR_svc
+
+                bl      cpu_int_c
+
+                pop     {r1-r3, lr}             @ Restore working regs & LR_svc
+
+                msr     cpsr_c, #MODE_IRQ+IMASK_IRQ @ Back to IRQ mode, IRQ disabled
+
+                mov     r12, #VIC_BASE          @ Tell VIC we are done
+                str     r12, [r12, #VIC_VADDR]
+
+                pop     {r12, lr}               @ Restore r12 & SPSR_irq
+                msr     spsr_cxsf, lr
+
+                ldmfd   sp!, {r0, pc}^          @ and return restoring r0
+
+
+@------------------------------------------------------------------------------
+
+                .section sark_alib
+
+@ void bx (uint addr)
+
+                .global bx
+                .type   bx, STT_FUNC 
+bx:
+
+                bx      r0                      @ Branch to r0
+
+
+@------------------------------------------------------------------------------
+
+@ void copy_msg (msg_t *to, msg_t *from)
+
+                .global copy_msg
+                .type   copy_msg, STT_FUNC 
+copy_msg:
+
+                ldrh    r2, [r1, #4]            @ Get length (bytes)
+                add     r0, r0, #4              @ Point past link word (from)
+                add     r1, r1, #4              @ Point past link word (to)
+                add     r2, r2, #4              @ Bump length by 4 (len/sum)
+
+
+@ Fast copy for word aligned buffers. Byte count "n" need not
+@ be a multiple of 4 but it will be rounded up to be so.
+
+@ void word_cpy (void *dest, const void *src, uint n)
+
+                .global word_cpy
+                .type   word_cpy, STT_FUNC 
+word_cpy:
+
+                tst     r2, #3
+                bicne   r2, r2, #3
+                addne   r2, r2, #4
+
+                push    {r4, lr}
+
+                subs    r2, r2, #32
+                bcc     wc2
+
+wc1:            ldm     r1!, {r3, r4, r12, lr}
+                stm     r0!, {r3, r4, r12, lr}
+                ldm     r1!, {r3, r4, r12, lr}
+                stm     r0!, {r3, r4, r12, lr}
+                subs    r2, r2, #32
+                bcs     wc1
+
+wc2:            lsls    r12, r2, #28
+                ldmcs   r1!, {r3, r4, r12, lr}
+                stmcs   r0!, {r3, r4, r12, lr}
+                ldmmi   r1!, {r3, r4}
+                stmmi   r0!, {r3, r4}
+
+                lsls    r12, r2, #30
+                ldrcs   r3, [r1], #4
+                strcs   r3, [r0], #4
+
+                pop     {r4, pc}
+
+
+@------------------------------------------------------------------------------
+
+@ uint cpu_int_off (void);
+
+                .global cpu_int_off
+                .type   cpu_int_off, STT_FUNC 
+cpu_int_off:
+
+                mrs     r0, cpsr
+                orr     r1, r0, #IMASK_ALL
+                msr     cpsr_c, r1
+                bx      lr
+
+
+@ void cpu_mode_set (uint cpsr);
+
+                .global cpu_mode_set
+                .type   cpu_mode_set, STT_FUNC 
+cpu_mode_set:
+
+                msr     cpsr_c, r0
+                bx      lr
+
+@------------------------------------------------------------------------------
+
+                .ifdef  THUMB
+
+@ uint irq_enable (void);
+
+                .global irq_enable
+                .type   irq_enable, STT_FUNC 
+irq_enable:
+
+                mrs     r0, cpsr
+                bic     r1, r0, #0x80
+                msr     cpsr_c, r1
+                bx      lr
+
+
+@ uint spin1_irq_disable (void);
+
+                .global spin1_irq_disable
+                .type   spin1_irq_disable, STT_FUNC 
+spin1_irq_disable:
+
+                mrs     r0, cpsr
+                orr     r1, r0, #0x80
+                msr     cpsr_c, r1
+                bx      lr
+
+
+@ void spin1_irq_restore (uint cpsr);
+
+                .global spin1_irq_restore
+                .type   spin1_irq_restore, STT_FUNC 
+spin1_irq_restore:
+
+                msr     cpsr_c, r0
+                bx      lr
+
+
+@  void wait_for_irq ();
+
+                .global wait_for_irq
+                .type   wait_for_irq, STT_FUNC 
+wait_for_irq:
+
+                mcr     p15, 0, r0, c7, c0, 4
+                bx      lr
+
+
+                .endif      
+
+@------------------------------------------------------------------------------
+
+@ void snooze (void);
+
+                .global snooze
+                .type   snooze, STT_FUNC 
+snooze:
+
+                mcr     p15, 0, r0, c7, c0, 4
+                b       snooze
+
+
+@------------------------------------------------------------------------------
+
+@ void str_cpy (char *dest, const char *src);
+
+                .global str_cpy
+                .type   str_cpy, STT_FUNC 
+str_cpy:
+
+                ldrb    r2, [r1], #1
+                cmp     r2, #0
+                strb    r2, [r0], #1
+                bne     str_cpy
+                bx      lr
+
+
+@------------------------------------------------------------------------------
+
+@ divmod_t div10 (uint n);
+
+                .global div10
+                .type   div10, STT_FUNC 
+div10:
+
+                .ifdef  GNU
+
+                sub     r2, r1, #10
+                sub     r1, r1, r1, lsr #2
+                add     r1, r1, r1, lsr #4
+                add     r1, r1, r1, lsr #8
+                add     r1, r1, r1, lsr #16
+                mov     r1, r1, lsr #3
+                add     r3, r1, r1, lsl #2
+                subs    r2, r2, r3, lsl #1
+                addpl   r1, r1, #1
+                addmi   r2, r2, #10
+                stm     r0, {r1, r2}
+                bx      lr
+
+                .else       
+
+                sub     r1, r0, #10             @ keep (x-10) for later
+                sub     r0, r0, r0, lsr #2
+                add     r0, r0, r0, lsr #4
+                add     r0, r0, r0, lsr #8
+                add     r0, r0, r0, lsr #16
+                mov     r0, r0, lsr #3
+                add     r2, r0, r0, lsl #2
+                subs    r1, r1, r2, lsl #1      @ calc (x-10) - (x/10)*10
+                addpl   r0, r0, #1              @ fix-up quotient
+                addmi   r1, r1, #10             @ fix-up remainder
+                bx      lr
+
+                .endif      
+
+
+@------------------------------------------------------------------------------
+
+@ void svc_put_char (uint c, char *stream);
+
+                .ifdef  GNU
+
+                .global svc_put_char
+                .type   svc_put_char, STT_FUNC 
+svc_put_char:
+
+                svc     #0
+                bx      lr
+
+
+                .endif      
+
+@------------------------------------------------------------------------------
+
+@ void schedule (uchar event_id, uint arg0, uint arg1)
+
+                .ifdef  SARK_API
+
+                .global schedule_sysmode
+                .global schedule
+
+                .type   schedule, STT_FUNC 
+schedule:
+
+                push    {r12, lr}               @ save r12 and lr_irq
+
+                mrs     r12, cpsr               @ Go to SYS mode
+                bic     lr, r12, #0x1f
+                orr     lr, lr, #MODE_SYS
+                msr     cpsr_c, lr
+
+                push    {r12, lr}               @ save lr_sys and cpsr_c
+
+                bl      schedule_sysmode
+
+                pop     {r12, lr}               @ restore lr_sys and cpsr_c
+                msr     cpsr_c, r12             @ back to IRQ mode
+
+                pop     {r12, lr}               @ restore r12 and lr_irq
+                bx      lr                      @ return using lr_irq
+
+
+                .endif      
+
+@------------------------------------------------------------------------------
+
+@ APLX Loader
+
+@ Format of APLX table - each entry except last is 4 words. First word
+@ is an opcode - ACOPY, RCOPY, FILL, EXEC, END. Next three words are operands.
+@ Copy/Fill always rounds up to multiple of 32 bytes and zero length is
+@ not sensible.
+
+@	APLX_ACOPY, APLX_RCOPY
+@	Dest address
+@	Srce address (relative to start of this entry if RCOPY)
+@	Length (bytes)
+
+@	APLX_FILL
+@	Dest address
+@	Length (bytes)
+@	Fill data
+
+@	APLX_EXEC
+@	Program counter
+@	(Unused)
+@	(Unused)
+
+@	APLX_END (or invalid opcode)
+@	(Unused)
+@	(Unused)
+@	(Unused)
+
+@ void proc_aplx (uint *table, uint dummy);
+
+                .thumb  
+
+                .global proc_aplx
+                .type   proc_aplx, STT_FUNC 
+proc_aplx:
+
+                push    {r4-r7, lr}             @ Save link and r4-7
+                ldr     r1, =ITCM_TOP_64        @ r1 -> destination
+                adr     r2, aplx_loader         @ r2 -> loader code
+                mov     r3, #4                  @ Move 16 words...
+
+ap0:            ldm     r2!, {r4-r7}            @ ... four at a time
+                stm     r1!, {r4-r7}
+                sub     r3, #1
+                bne     ap0
+
+                sub     r1, #63                 @ r1 -> ITCM_TOP - 64 + 1
+                bx      r1
+
+@ enter with table address in r0
+
+                .align  4
+
+aplx_loader:    ldm     r0!, {r1-r4}            @ Get opcode & operands
+
+                cmp     r1, #APLX_ACOPY         @ Copy absolute
+                beq     aplx_copy
+                cmp     r1, #APLX_RCOPY         @ Copy relative
+                beq     aplx_rcopy
+                cmp     r1, #APLX_FILL          @ Fill
+                beq     aplx_fill
+                cmp     r1, #APLX_EXEC          @ Execute
+                beq     aplx_exec
+
+                pop     {r4-r7, pc}             @ Restore & return
+
+aplx_rcopy:     add     r3, r0                  @ Make pointer relative and
+                sub     r3, #APLX_SIZE          @ reduce by table entry size
+
+aplx_copy:      ldm     r3!, {r1, r5-r7}
+                stm     r2!, {r1, r5-r7}
+                ldm     r3!, {r1, r5-r7}
+                stm     r2!, {r1, r5-r7}
+                sub     r4, #32
+                bhi     aplx_copy
+                b       aplx_loader
+
+aplx_fill:      movs    r5, r4
+                movs    r6, r4
+                movs    r7, r4
+
+ap1:            stm     r2!, {r4-r7}
+                stm     r2!, {r4-r7}
+                sub     r3, #32
+                bhi     ap1
+                b       aplx_loader
+
+aplx_exec:      blx     r2
+                b       aplx_loader
+
+
+                .align  4
+
+@------------------------------------------------------------------------------
+
+@ This section is placed last, after all other code to be copied to ITCM.
+@ It forces the length of the section to be a multiple of 4 bytes as it
+@ was previously Thumb aligned and this caused problems in copying the RW
+@ data that followed. This is a bodge!
+
+                .section sark_align
+
+                .word   DEAD_WORD
+
+@------------------------------------------------------------------------------
