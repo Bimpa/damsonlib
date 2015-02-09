@@ -4,7 +4,9 @@ The DAMSON lib runtime environment
 Documentation on damson website: http://damson.sites.sheffield.ac.uk/
 
 Author: Paul Richmond
+
 Copyright: Univeristy of Sheffield
+
 Contact: p.richmond@Sheffield.ac.uk
 
 #ARM GNU tools compiler
