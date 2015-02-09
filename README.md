@@ -19,7 +19,7 @@ In order to add the toolkit binaries directory to your bash profile path. Open y
 
 The following should be appended to the end of the file where /home/paul/data/arm/gnutools/bin is the directory of the arm GNU tools binaries directory.
 
-> #add arm tools to path
+> \#add arm tools to path
 > GCCARMPATH=/home/paul/arm/gnutools/bin
 > PATH=$GCCARMPATH:$PATH:.
 
